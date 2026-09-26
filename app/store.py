@@ -1000,18 +1000,24 @@ def preview_release_plan(nodes: list[dict]) -> dict:
     that do not exist.
     """
     merge_ids = [node["merge_id"] for node in nodes]
-    # SQLite caps host parameters at 999 on older builds; fetch the rows
-    # in chunks while preserving read-only access (no transaction needed).
+    # SQLite caps host parameters at 999 on older builds, so fetch the rows
+    # in 500-id chunks. All chunks run inside one read-only snapshot
+    # transaction: adjudications committing between two chunk queries must
+    # not mix an old prerequisite state with a new successor state (which
+    # would falsely report a publishable node as dependency_blocked). The
+    # snapshot connection writes nothing and bumps no revision; the next
+    # request opens a fresh snapshot and observes any committed state.
     state: dict[str, dict] = {}
-    for start in range(0, len(merge_ids), 500):
-        chunk = merge_ids[start : start + 500]
-        placeholders = ", ".join("?" for _ in chunk)
-        for row in db.query_all(
-            f"SELECT id, status, revision FROM merges WHERE id IN ({placeholders})",
-            tuple(chunk),
-        ):
-            state[row["id"]] = {
-                "status": row["status"],
-                "revision": row["revision"],
-            }
+    with db.read_snapshot() as conn:
+        for start in range(0, len(merge_ids), 500):
+            chunk = merge_ids[start : start + 500]
+            placeholders = ", ".join("?" for _ in chunk)
+            for row in conn.execute(
+                f"SELECT id, status, revision FROM merges WHERE id IN ({placeholders})",
+                tuple(chunk),
+            ):
+                state[row["id"]] = {
+                    "status": row["status"],
+                    "revision": row["revision"],
+                }
     return build_preview(nodes, state)

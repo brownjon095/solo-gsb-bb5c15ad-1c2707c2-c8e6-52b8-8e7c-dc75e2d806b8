@@ -1,5 +1,6 @@
 """Tests for POST /release-plans/preview and its pure planner."""
 
+import contextlib
 import os
 import tempfile
 
@@ -8,6 +9,7 @@ os.environ["DATABASE_PATH"] = os.path.join(tempfile.mkdtemp(), "test_release.db"
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import db, store  # noqa: E402
 from app.main import app  # noqa: E402
 from app.release_plan import InvalidReleasePlan, build_preview  # noqa: E402
 
@@ -333,3 +335,109 @@ def test_planner_duplicate_dependency_entry_is_tolerated():
         _st("ab"),
     )
     assert len(plan["batches"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Snapshot consistency: all chunk queries of one preview share one snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_chunked_reads_share_one_snapshot_across_concurrent_adjudication(
+    client, monkeypatch
+):
+    # More than one 500-id chunk: the prerequisite lives in chunk 1 and its
+    # successor in chunk 2. Both are created pending; both are adjudicated
+    # (by a concurrent writer) after chunk 1 is read and before chunk 2 is
+    # read. Because every chunk reads one shared snapshot, the preview must
+    # keep seeing the pre-adjudication state for both nodes; it must not mix
+    # the old prerequisite (pending) with the new successor (resolved) and
+    # falsely report the successor as dependency_blocked.
+    p = make_pending(client)
+    s = make_pending(client)
+    fillers = [make_resolved(client, i)[0] for i in range(499)]
+
+    nodes = [
+        {"merge_id": p},
+        *({"merge_id": mid} for mid in fillers),
+        {"merge_id": s, "depends_on": [p]},
+    ]
+    assert len(nodes) == 501  # p + 499 fillers in chunk 1; s alone in chunk 2
+
+    real_read_snapshot = db.read_snapshot
+    fired = False
+
+    def adjudicate_both():
+        # A real, concurrent adjudication on the shared database: revisions
+        # bump and an audit event is appended, exactly like another client.
+        store.apply_resolutions(
+            p, 1, [{"pointer": "/host", "choice": "left"}]
+        )
+        store.apply_resolutions(
+            s, 1, [{"pointer": "/host", "choice": "left"}]
+        )
+
+    class _ConnProxy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, query, params=()):
+            nonlocal fired
+            # The chunk-2 read begins only after chunk 1 has been consumed;
+            # adjudicate there, while the snapshot transaction is open.
+            if not fired and s in params:
+                adjudicate_both()
+                fired = True
+            return self._conn.execute(query, params)
+
+    @contextlib.contextmanager
+    def hooked_read_snapshot():
+        with real_read_snapshot() as conn:
+            yield _ConnProxy(conn)
+
+    monkeypatch.setattr(db, "read_snapshot", hooked_read_snapshot)
+
+    resp = preview(client, nodes)
+    assert resp.status_code == 200, resp.text
+    assert fired, "test harness did not interleave the adjudications"
+    plan = resp.json()
+
+    # Snapshot view: neither adjudication is visible. The successors's own
+    # merge is still pending, so it blocks on itself — never on p.
+    blocked = {item["merge_id"]: item for item in plan["blocked"]}
+    assert blocked[p] == {
+        "merge_id": p,
+        "revision": 1,
+        "reason": "pending",
+        "blocked_by": [],
+    }
+    assert blocked[s] == {
+        "merge_id": s,
+        "revision": 1,
+        "reason": "pending",
+        "blocked_by": [],
+    }
+    assert [n["merge_id"] for n in plan["batches"][0]["nodes"]] == sorted(
+        fillers
+    )
+
+    # After the adjudications have committed, a fresh request opens a new
+    # snapshot and reports the new state: p then s ship, at revision 2.
+    resp = preview(client, nodes)
+    assert resp.status_code == 200, resp.text
+    plan = resp.json()
+    assert plan["blocked"] == []
+    assert [
+        [n["merge_id"] for n in batch["nodes"]] for batch in plan["batches"]
+    ] == [sorted(fillers + [p]), [s]]
+    by_node = {
+        n["merge_id"]: n["revision"]
+        for batch in plan["batches"]
+        for n in batch["nodes"]
+    }
+    assert by_node[p] == 2 and by_node[s] == 2
+
+    # The preview path stays read-only: each merge carries exactly the one
+    # event from the real adjudication above, none from either preview.
+    for mid in (p, s):
+        audit_view = client.get(f"/merges/{mid}/audit").json()
+        assert audit_view["event_count"] == 1

@@ -30,6 +30,15 @@ EVIDENCE_HMAC_KEY=<至少 32 字节的随机密钥> docker compose up --build
 
 本地直接运行（非 Docker）时同样需要：`export EVIDENCE_HMAC_KEY=<...>` 后再 `uvicorn app.main:app --port 8000`。
 
+### 环境配置一览
+
+| 环境变量 | 必需 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `EVIDENCE_HMAC_KEY` | 是 | Compose 内置仅供本地开发的默认值；镜像内**无默认值**，缺失或不足 32 字节则拒绝启动 | 证据包 HMAC-SHA256 签名密钥（至少 32 字节），真实部署必须覆盖 |
+| `DATABASE_PATH` | 否 | `./merges.db`（本地直接运行时）；Compose 固定为 `/data/merges.db`（位于 `merge-data` volume 内） | SQLite 数据文件路径，父目录不存在时自动创建 |
+
+服务监听容器内 `8000` 端口，Compose 已映射到宿主机，因此 API 一律通过 **http://localhost:8000** 访问（健康检查 `GET http://localhost:8000/health`）。无需配置其它环境变量即可用 `docker compose up --build` 一条命令启动。
+
 ## 合并规则
 
 按 JSON Pointer（RFC 6901）逐路径递归：
@@ -711,6 +720,7 @@ curl -s -X POST http://localhost:8000/evidence/verify \
 多个合并单需要按依赖关系分批发布时（例如先发基础配置、再发依赖它的服务），可把发布计划描述为一个**节点列表**：每个节点是一个**已存在的合并单**（`merge_id`）加上它的前置节点（`depends_on`，即必须先发布的合并单）。接口读取这些合并单的**当前状态**并按依赖图计算稳定的发布批次：
 
 - **只读、不写库**：仅引用现有合并单并读取 `status` / `revision`，不创建任何记录、不更新状态、不递增 revision、不追加审计事件，可安全反复调用；
+- **单次预览共享同一读取快照**：当计划很大（合并单数量超过 SQLite 单次查询参数上限）时，状态读取会按每 500 个 `merge_id` 分块查询，但**同一次预览的全部分块查询都运行在一个只读快照事务中**（WAL 快照），批次、阻塞原因与每个节点的 `revision` 全部依据该同一快照计算。即使在两个分块查询之间有并发裁决提交，本次预览也不会混用旧的前置状态与新的后继状态（那种混用会把本可发布的后继误报为 `dependency_blocked`）；裁决提交完成后**再次发起预览**会打开新快照，反映提交后的新状态。
 - **整单校验**：节点 `merge_id` 必须唯一；每个 `depends_on` 都必须指向**同一列表内的节点**；不允许自依赖与环；引用未知合并单同样使**整个请求报错（`400`）**，不会返回部分批次；
 - **稳定批次**：一个节点可发布当且仅当它已 `resolved` **且**其全部前置节点都可发布。节点按依赖层级逐层剥离，每层是一个发布批次（`batch` 从 1 开始），**同一批次内按 `merge_id` 字典序排序**，因此相同图与相同状态下响应逐字节稳定；
 - **阻塞节点**：未入批的节点全部列入 `blocked`：自身仍为 `pending` 的节点标为 `reason: "pending"`（`blocked_by` 为空，表示待处理的是它自己）；自身已 `resolved` 但前置尚不可发布的节点标为 `reason: "dependency_blocked"`，`blocked_by` 列出**直接**阻塞它的前置节点（排序、去重）；
@@ -780,7 +790,7 @@ pip install -r requirements.txt
 pip install httpx pytest
 export EVIDENCE_HMAC_KEY=<至少 32 字节的密钥>   # 证据包签名密钥，缺失或过短无法启动
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（227 项）
+python -m pytest tests/ -q                  # 运行测试（230 项）
 ```
 
 ## 项目结构

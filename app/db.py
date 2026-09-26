@@ -75,16 +75,49 @@ CREATE TABLE IF NOT EXISTS merge_audit_events (
 """
 
 
+def _ensure_database_directory() -> None:
+    directory = os.path.dirname(os.path.abspath(DATABASE_PATH))
+    os.makedirs(directory, exist_ok=True)
+
+
 def connect() -> sqlite3.Connection:
     global _conn
     if _conn is None:
-        directory = os.path.dirname(os.path.abspath(DATABASE_PATH))
-        os.makedirs(directory, exist_ok=True)
+        _ensure_database_directory()
         _conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA foreign_keys=ON")
     return _conn
+
+
+@contextmanager
+def read_snapshot():
+    """Run a multi-query read-only request on one shared SQLite snapshot.
+
+    A separate short-lived connection (not the writer connection, and not
+    taking the global write lock) opens one explicit deferred transaction.
+    In WAL mode every read inside that transaction sees the same database
+    snapshot — the one established by the first read — so adjudication
+    commits landing between the statements of one request cannot mix old
+    and new states. The connection is ``query_only`` and the transaction is
+    rolled back on exit, so a snapshot read provably writes nothing.
+    A subsequent request opens a new snapshot and therefore sees the
+    committed new state.
+    """
+    _ensure_database_directory()
+    # isolation_level=None puts the driver in autocommit mode, making our
+    # BEGIN/ROLLBACK below the only transaction control (no implicit
+    # transactions started around individual statements).
+    conn = sqlite3.connect(DATABASE_PATH, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute("BEGIN")
+        yield conn
+    finally:
+        conn.rollback()
+        conn.close()
 
 
 # Objects created after the initial release; applied to database files that
