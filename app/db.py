@@ -196,6 +196,27 @@ def transaction():
             conn.commit()
 
 
+@contextmanager
+def read_snapshot():
+    """Run a sequence of reads against one consistent SQLite snapshot.
+
+    An explicit read transaction is opened on the shared connection, so
+    every SELECT in the block sees the database as of the same commit: a
+    concurrent writer committing between two statements cannot leak newer
+    rows into the later one (in WAL mode a reader keeps its snapshot for
+    the whole transaction). The global lock is held for the whole block —
+    in-process writers cannot interleave either — and the transaction is
+    rolled back at the end: a snapshot never writes anything.
+    """
+    with _lock:
+        conn = connect()
+        conn.execute("BEGIN")
+        try:
+            yield conn
+        finally:
+            conn.rollback()
+
+
 def query_one(query: str, params: tuple = ()) -> sqlite3.Row | None:
     with _lock:
         return connect().execute(query, params).fetchone()

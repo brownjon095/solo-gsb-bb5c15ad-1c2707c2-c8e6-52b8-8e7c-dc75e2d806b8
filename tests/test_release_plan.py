@@ -1,6 +1,8 @@
 """Tests for POST /release-plans/preview and its pure planner."""
 
+import contextlib
 import os
+import sqlite3
 import tempfile
 
 os.environ["DATABASE_PATH"] = os.path.join(tempfile.mkdtemp(), "test_release.db")
@@ -8,6 +10,7 @@ os.environ["DATABASE_PATH"] = os.path.join(tempfile.mkdtemp(), "test_release.db"
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import db, store  # noqa: E402
 from app.main import app  # noqa: E402
 from app.release_plan import InvalidReleasePlan, build_preview  # noqa: E402
 
@@ -64,6 +67,27 @@ def resolve(client, merge_id, revision=1):
 
 def preview(client, nodes):
     return client.post("/release-plans/preview", json={"nodes": nodes})
+
+
+def resolve_directly(*merge_ids):
+    """Commit a resolution on a separate connection (a concurrent writer).
+
+    Simulates an adjudication that commits outside the app's own
+    connection, the way a concurrent request lands between two reads of
+    one preview.
+    """
+    conn = sqlite3.connect(db.DATABASE_PATH)
+    try:
+        for merge_id in merge_ids:
+            conn.execute(
+                "UPDATE merges SET status = 'resolved', "
+                "revision = revision + 1, result = document, "
+                "updated_at = ? WHERE id = ?",
+                ("2026-09-26T00:00:00+00:00", merge_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +194,115 @@ def test_revision_change_is_visible_on_re_preview_without_plan_mutation(client):
     plan = resp.json()
     assert plan["blocked"] == []
     assert plan["batches"][0]["nodes"] == [{"merge_id": mid, "revision": 2}]
+
+
+# ---------------------------------------------------------------------------
+# Snapshot consistency across chunked state reads
+# ---------------------------------------------------------------------------
+
+
+def test_read_snapshot_pins_one_consistent_snapshot(client):
+    mid = make_pending(client)
+    with db.read_snapshot() as conn:
+        before = conn.execute(
+            "SELECT status, revision FROM merges WHERE id = ?", (mid,)
+        ).fetchone()
+        # A concurrent adjudication commits on another connection while the
+        # snapshot is open.
+        resolve_directly(mid)
+        after = conn.execute(
+            "SELECT status, revision FROM merges WHERE id = ?", (mid,)
+        ).fetchone()
+    # Both reads inside the snapshot see the same pre-resolution state.
+    assert before["status"] == after["status"] == "pending"
+    assert before["revision"] == after["revision"] == 1
+    # A fresh read sees the committed resolution.
+    row = db.query_one("SELECT status, revision FROM merges WHERE id = ?", (mid,))
+    assert row["status"] == "resolved"
+    assert row["revision"] == 2
+
+
+def test_preview_chunks_share_one_snapshot_under_concurrent_resolution(
+    client, monkeypatch
+):
+    prerequisite = make_pending(client)
+    successor = make_pending(client)
+    # One merge per chunk: the prerequisite is read in the first chunk, the
+    # successor in the second.
+    monkeypatch.setattr(store, "_STATE_CHUNK_SIZE", 1)
+
+    real_read_snapshot = db.read_snapshot
+    injected = []
+
+    @contextlib.contextmanager
+    def wrapped_read_snapshot():
+        with real_read_snapshot() as conn:
+            calls = {"count": 0}
+
+            class _ConnProxy:
+                def execute(self, sql, params=()):
+                    calls["count"] += 1
+                    if calls["count"] == 2 and not injected:
+                        # Both merges are resolved concurrently after the
+                        # first chunk was read and before the second is.
+                        resolve_directly(prerequisite, successor)
+                        injected.append(True)
+                    return conn.execute(sql, params)
+
+            yield _ConnProxy()
+
+    monkeypatch.setattr(db, "read_snapshot", wrapped_read_snapshot)
+
+    nodes = [
+        {"merge_id": prerequisite},
+        {"merge_id": successor, "depends_on": [prerequisite]},
+    ]
+    resp = preview(client, nodes)
+    assert resp.status_code == 200, resp.text
+    assert injected, "the concurrent resolution must land between chunk reads"
+    plan = resp.json()
+    # Consistent snapshot: both nodes come from the pre-resolution state.
+    # The successor is never reported as resolved-but-dependency-blocked by
+    # a prerequisite whose resolution the first chunk simply did not see.
+    assert plan["batches"] == []
+    blocked = {item["merge_id"]: item for item in plan["blocked"]}
+    assert blocked[prerequisite]["reason"] == "pending"
+    assert blocked[prerequisite]["revision"] == 1
+    assert blocked[successor]["reason"] == "pending"
+    assert blocked[successor]["revision"] == 1
+
+    # The preview wrote nothing: no revision bump, no audit events.
+    for mid in (prerequisite, successor):
+        audit = client.get(f"/merges/{mid}/audit").json()
+        assert audit["event_count"] == 0
+
+    # Once the concurrent adjudication has committed, a fresh preview opens
+    # a new snapshot and shows the new state: both nodes publishable.
+    monkeypatch.undo()
+    resp = preview(client, nodes)
+    assert resp.status_code == 200, resp.text
+    plan = resp.json()
+    assert plan["blocked"] == []
+    batches = [[n["merge_id"] for n in batch["nodes"]] for batch in plan["batches"]]
+    assert batches == [[prerequisite], [successor]]
+    revisions = {
+        n["merge_id"]: n["revision"] for batch in plan["batches"] for n in batch["nodes"]
+    }
+    assert revisions == {prerequisite: 2, successor: 2}
+
+
+def test_preview_plan_spanning_multiple_state_chunks(client):
+    # 501 nodes exceed the 500-row chunk size: the state is fetched in two
+    # queries and every node must still be batched.
+    ids = sorted(make_resolved(client, i)[0] for i in range(501))
+    resp = preview(client, [{"merge_id": mid} for mid in reversed(ids)])
+    assert resp.status_code == 200, resp.text
+    plan = resp.json()
+    assert plan["blocked"] == []
+    assert len(plan["batches"]) == 1
+    nodes = plan["batches"][0]["nodes"]
+    assert [n["merge_id"] for n in nodes] == ids
+    assert all(n["revision"] == 1 for n in nodes)
 
 
 # ---------------------------------------------------------------------------

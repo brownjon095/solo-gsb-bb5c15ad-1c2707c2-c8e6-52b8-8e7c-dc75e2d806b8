@@ -10,10 +10,17 @@ docker compose up --build
 
 依赖安装（镜像构建时，含 `jsonschema` Draft 2020-12 校验）与 SQLite 建表（应用启动时）自动完成，无需任何额外步骤。
 
-- **API 地址**：http://localhost:8000
+- **API 地址**：http://localhost:8000（Compose 将容器 `8000` 端口映射到本机 `8000`）
 - **交互式文档（Swagger UI）**：http://localhost:8000/docs
 - **端口**：`8000`
 - 健康检查：`GET http://localhost:8000/health`
+
+### 环境配置
+
+| 环境变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `EVIDENCE_HMAC_KEY` | **是** | 证据包 HMAC-SHA256 签名密钥，**至少 32 字节**；缺失或过短时应用拒绝启动。`docker-compose.yml` 内置了仅供本地开发的默认值，真实部署必须覆盖（见下文） |
+| `DATABASE_PATH` | 否 | SQLite 数据文件路径。Compose 中默认为 `/data/merges.db`（持久化在名为 `merge-data` 的 Docker volume 中）；本地直接运行时默认为 `./merges.db` |
 
 SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容器内路径 `/data/merges.db`，可通过环境变量 `DATABASE_PATH` 修改）。
 
@@ -711,6 +718,7 @@ curl -s -X POST http://localhost:8000/evidence/verify \
 多个合并单需要按依赖关系分批发布时（例如先发基础配置、再发依赖它的服务），可把发布计划描述为一个**节点列表**：每个节点是一个**已存在的合并单**（`merge_id`）加上它的前置节点（`depends_on`，即必须先发布的合并单）。接口读取这些合并单的**当前状态**并按依赖图计算稳定的发布批次：
 
 - **只读、不写库**：仅引用现有合并单并读取 `status` / `revision`，不创建任何记录、不更新状态、不递增 revision、不追加审计事件，可安全反复调用；
+- **单次响应读取一致**：节点状态按 500 个一批分块查询，**一次预览的所有分块共享同一 SQLite 读取快照**——批次、阻塞原因与每个 `revision` 都依据同一快照计算。即使计划超过 500 个合并单、且读取期间有并发裁决提交，响应也不会混用前置的旧状态与后继的新状态；并发裁决完成后再次请求即反映最新状态；
 - **整单校验**：节点 `merge_id` 必须唯一；每个 `depends_on` 都必须指向**同一列表内的节点**；不允许自依赖与环；引用未知合并单同样使**整个请求报错（`400`）**，不会返回部分批次；
 - **稳定批次**：一个节点可发布当且仅当它已 `resolved` **且**其全部前置节点都可发布。节点按依赖层级逐层剥离，每层是一个发布批次（`batch` 从 1 开始），**同一批次内按 `merge_id` 字典序排序**，因此相同图与相同状态下响应逐字节稳定；
 - **阻塞节点**：未入批的节点全部列入 `blocked`：自身仍为 `pending` 的节点标为 `reason: "pending"`（`blocked_by` 为空，表示待处理的是它自己）；自身已 `resolved` 但前置尚不可发布的节点标为 `reason: "dependency_blocked"`，`blocked_by` 列出**直接**阻塞它的前置节点（排序、去重）；
@@ -780,7 +788,7 @@ pip install -r requirements.txt
 pip install httpx pytest
 export EVIDENCE_HMAC_KEY=<至少 32 字节的密钥>   # 证据包签名密钥，缺失或过短无法启动
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（227 项）
+python -m pytest tests/ -q                  # 运行测试（230 项）
 ```
 
 ## 项目结构
@@ -799,7 +807,7 @@ app/
   evidence.py   # 可移植证据包：规范化载荷 + HMAC-SHA256 签名；免数据库三阶段校验（签名→审计链→补丁重放）
   release_plan.py # 发布编排预览（纯内存）：依赖图校验（唯一/自依赖/悬空/环）+ 按依赖层级的稳定发布批次与阻塞原因
   store.py      # 合并单状态机 + 解决草案 + 历史复用 + 撤销 + 证据包导出 + 发布计划只读查询：revision 校验、冲突解决、不可变结果、schema 门禁
-  db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移、审计表 CHECK 扩展与单事务提交支持）
+  db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移、审计表 CHECK 扩展、单事务提交与只读快照支持）
   models.py     # Pydantic 请求模型（含可选 result_schema、草案编辑、历史复用、撤销请求、发布计划预览、证据包校验请求）
 tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁、草案、历史复用、审计链、撤销重放、证据包篡改/伪造/断链/错误补丁与发布编排预览测试）
 Dockerfile

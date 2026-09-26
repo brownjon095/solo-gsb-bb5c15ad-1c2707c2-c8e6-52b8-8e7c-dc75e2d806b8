@@ -987,6 +987,9 @@ def undo_last_resolution(merge_id: str, expected_revision: int) -> dict:
 # Read-only release-plan preview
 # ---------------------------------------------------------------------------
 
+# SQLite caps host parameters at 999 on older builds; stay well below.
+_STATE_CHUNK_SIZE = 500
+
 
 def preview_release_plan(nodes: list[dict]) -> dict:
     """Preview stable release batches for a dependency graph of merge orders.
@@ -998,20 +1001,25 @@ def preview_release_plan(nodes: list[dict]) -> dict:
     bumps a revision. Raises release_plan.InvalidReleasePlan (400) for
     duplicate nodes, self-dependencies, dangling edges, cycles or merges
     that do not exist.
+
+    Plans larger than one chunk are fetched in several queries, and all of
+    them run inside a single SQLite read snapshot: a merge resolved
+    concurrently is either visible in every chunk or in none, so the
+    preview never mixes a prerequisite's old state with a successor's new
+    one. A later preview opens a fresh snapshot and sees the new state.
     """
     merge_ids = [node["merge_id"] for node in nodes]
-    # SQLite caps host parameters at 999 on older builds; fetch the rows
-    # in chunks while preserving read-only access (no transaction needed).
     state: dict[str, dict] = {}
-    for start in range(0, len(merge_ids), 500):
-        chunk = merge_ids[start : start + 500]
-        placeholders = ", ".join("?" for _ in chunk)
-        for row in db.query_all(
-            f"SELECT id, status, revision FROM merges WHERE id IN ({placeholders})",
-            tuple(chunk),
-        ):
-            state[row["id"]] = {
-                "status": row["status"],
-                "revision": row["revision"],
-            }
+    with db.read_snapshot() as conn:
+        for start in range(0, len(merge_ids), _STATE_CHUNK_SIZE):
+            chunk = merge_ids[start : start + _STATE_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            for row in conn.execute(
+                f"SELECT id, status, revision FROM merges WHERE id IN ({placeholders})",
+                tuple(chunk),
+            ):
+                state[row["id"]] = {
+                    "status": row["status"],
+                    "revision": row["revision"],
+                }
     return build_preview(nodes, state)
