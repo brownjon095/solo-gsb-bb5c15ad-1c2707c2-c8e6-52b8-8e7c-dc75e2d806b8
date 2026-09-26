@@ -1,0 +1,18 @@
+services:
+  merge-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/merges.db
+      # HMAC-SHA256 key for signing evidence packages (min 32 bytes; the
+      # app refuses to start without it). The default keeps single-command
+      # local startup working — override it in any real deployment:
+      #   EVIDENCE_HMAC_KEY=<your-secret> docker compose up --build
+      EVIDENCE_HMAC_KEY: ${EVIDENCE_HMAC_KEY:-dev-only-evidence-key-change-me-in-production}
+    volumes:
+      - merge-data:/data
+    restart: unless-stopped
+
+volumes:
+  merge-data:
